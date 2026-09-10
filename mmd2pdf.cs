@@ -24,7 +24,9 @@ static class Program
     static int Main(string[] args)
     {
         ConfigureOutput(args);
+        logPath = FindLogPath(args);
         int code = Run(args);
+        WriteLog(args, code);
         // ダブルクリックやドラッグ＆ドロップで起動した場合、結果を読めるように待つ
         if (code != 0 && OwnsConsole() && !Console.IsInputRedirected)
         {
@@ -59,6 +61,49 @@ static class Program
             Console.SetError(new StreamWriter(Console.OpenStandardError(), enc) { AutoFlush = true });
     }
 
+    // --log または環境変数 MMD2PDF_LOG で指定されたファイルに、受け取った入力と結果を追記する（原因調査用）
+    static string logPath;
+    static readonly StringBuilder logBody = new StringBuilder();
+
+    static string FindLogPath(string[] args)
+    {
+        int i = Array.IndexOf(args, "--log");
+        if (i >= 0 && i + 1 < args.Length) return args[i + 1];
+        string env = Environment.GetEnvironmentVariable("MMD2PDF_LOG");
+        return string.IsNullOrWhiteSpace(env) ? null : env;
+    }
+
+    static void Log(string line)
+    {
+        logBody.AppendLine(line);
+    }
+
+    static void WriteLog(string[] args, int code)
+    {
+        if (logPath == null) return;
+        try
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  mmd2pdf " + Assembly.GetExecutingAssembly().GetName().Version);
+            sb.AppendLine("引数: " + string.Join(" ", Array.ConvertAll(args, a => a.IndexOf(' ') >= 0 ? "\"" + a + "\"" : a)));
+            sb.AppendLine("実行ユーザー: " + Environment.UserDomainName + "\\" + Environment.UserName +
+                (Environment.UserInteractive ? "" : "（非対話セッション）"));
+            sb.AppendLine("カレントフォルダ: " + Environment.CurrentDirectory);
+            sb.Append(logBody);
+            sb.AppendLine("終了コード: " + code);
+            sb.AppendLine();
+            string full = Path.GetFullPath(logPath);
+            string dir = Path.GetDirectoryName(full);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            // BOM 付き UTF-8（新規作成時のみ BOM が入る）にして、メモ帳でも文字化けしないようにする
+            File.AppendAllText(full, sb.ToString(), new UTF8Encoding(true));
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine("ログを書き込めませんでした: " + e.Message);
+        }
+    }
+
     static bool OwnsConsole()
     {
         try { return GetConsoleProcessList(new uint[2], 2) <= 1; } catch { return false; }
@@ -88,6 +133,10 @@ static class Program
                 if (++i >= args.Length) return Usage("--encoding の後に utf8 または sjis を指定してください。");
                 if (ParseEncoding(args[i]) == null) return Usage("未対応の文字コードです: " + args[i]);
             }
+            else if (a == "--log")
+            {
+                if (++i >= args.Length) return Usage("--log の後にログファイルのパスを指定してください。");
+            }
             else if (a == "--no-open") open = false;
             else if (a == "-y" || a == "--overwrite") overwrite = true;
             else if (a == "-h" || a == "--help" || a == "/?") { Usage(null); return 0; }
@@ -99,18 +148,25 @@ static class Program
         if (input == null && Console.IsInputRedirected) input = "-";
         if (input == null) return Usage(null);
 
-        string text;
+        byte[] raw;
         if (input == "-")
         {
-            using (var stdin = Console.OpenStandardInput()) text = DecodeText(ReadAll(stdin));
+            using (var stdin = Console.OpenStandardInput()) raw = ReadAll(stdin);
             if (output == null) output = Path.Combine(Environment.CurrentDirectory, "diagram.pdf");
         }
         else
         {
             if (!File.Exists(input)) return Fail("入力ファイルが見つかりません: " + input);
-            text = DecodeText(File.ReadAllBytes(input));
+            raw = File.ReadAllBytes(input);
             if (output == null) output = Path.ChangeExtension(Path.GetFullPath(input), ".pdf");
         }
+        string encName;
+        string text = DecodeText(raw, out encName);
+        Log("入力: " + (input == "-" ? "標準入力" : Path.GetFullPath(input)) + "（" + raw.Length + " バイト、文字コード: " + encName + "）");
+        Log("先頭バイト: " + (raw.Length == 0 ? "（なし）" : BitConverter.ToString(raw, 0, Math.Min(raw.Length, 16))));
+        Log("---- 受け取った内容 ここから ----");
+        Log(text.TrimEnd('\r', '\n'));
+        Log("---- 受け取った内容 ここまで ----");
         output = Path.GetFullPath(output);
         if (File.Exists(output) && !overwrite)
             return Fail("出力先の PDF が既に存在します（上書きするには --overwrite を指定してください）: " + output);
@@ -140,7 +196,9 @@ static class Program
             try { Directory.Delete(work, true); } catch { }
         }
 
-        Console.WriteLine("PDF を生成しました（" + diagrams.Count + " ページ）: " + output);
+        string done = "PDF を生成しました（" + diagrams.Count + " ページ）: " + output;
+        Console.WriteLine(done);
+        Log("結果: " + done);
         if (open)
         {
             try { Process.Start(new ProcessStartInfo(output) { UseShellExecute = true }); }
@@ -155,13 +213,22 @@ static class Program
     }
 
     // UTF-8（BOM 有無）/ UTF-16 / Shift_JIS を自動判別して文字列にする
-    static string DecodeText(byte[] b)
+    static string DecodeText(byte[] b, out string name)
     {
-        if (b.Length >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) return Encoding.UTF8.GetString(b, 3, b.Length - 3);
-        if (b.Length >= 2 && b[0] == 0xFF && b[1] == 0xFE) return Encoding.Unicode.GetString(b, 2, b.Length - 2);
-        if (b.Length >= 2 && b[0] == 0xFE && b[1] == 0xFF) return Encoding.BigEndianUnicode.GetString(b, 2, b.Length - 2);
-        try { return new UTF8Encoding(false, true).GetString(b); }
-        catch (DecoderFallbackException) { return Encoding.GetEncoding(932).GetString(b); }
+        if (b.Length >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) { name = "UTF-8（BOM 付き）"; return Encoding.UTF8.GetString(b, 3, b.Length - 3); }
+        if (b.Length >= 2 && b[0] == 0xFF && b[1] == 0xFE) { name = "UTF-16 LE"; return Encoding.Unicode.GetString(b, 2, b.Length - 2); }
+        if (b.Length >= 2 && b[0] == 0xFE && b[1] == 0xFF) { name = "UTF-16 BE"; return Encoding.BigEndianUnicode.GetString(b, 2, b.Length - 2); }
+        try
+        {
+            string s = new UTF8Encoding(false, true).GetString(b);
+            name = "UTF-8";
+            return s;
+        }
+        catch (DecoderFallbackException)
+        {
+            name = "Shift_JIS";
+            return Encoding.GetEncoding(932).GetString(b);
+        }
     }
 
     // Markdown の ```mermaid ブロックがあればそれぞれを 1 図として取り出す。なければ全体を 1 図とみなす
@@ -354,7 +421,11 @@ html,body{margin:0;padding:0;background:__BG__;-webkit-print-color-adjust:exact;
 
     static int Usage(string error)
     {
-        if (error != null) Console.Error.WriteLine("エラー: " + error + Environment.NewLine);
+        if (error != null)
+        {
+            Console.Error.WriteLine("エラー: " + error + Environment.NewLine);
+            Log("エラー: " + error);
+        }
         Console.WriteLine(
 @"mmd2pdf - Mermaid の図を PDF にして開きます
 
@@ -376,6 +447,8 @@ html,body{margin:0;padding:0;background:__BG__;-webkit-print-color-adjust:exact;
   -t, --theme    default / neutral / dark / forest / base（省略時は default）
   -e, --encoding メッセージをリダイレクトで受け取る場合の文字コード utf8 / sjis
                  （省略時はシステム既定。日本語 Windows では Shift_JIS）
+  --log ファイル  受け取った入力の内容と結果をログファイルに追記する（UTF-8）
+                 環境変数 MMD2PDF_LOG にパスを設定しても有効になる
   --no-open      生成後に PDF を開かない
 
 動作環境: Windows 10/11（Microsoft Edge を使用。追加インストール不要）");
@@ -385,6 +458,7 @@ html,body{margin:0;padding:0;background:__BG__;-webkit-print-color-adjust:exact;
     static int Fail(string message)
     {
         Console.Error.WriteLine("エラー: " + message);
+        Log("エラー: " + message);
         return 1;
     }
 }
