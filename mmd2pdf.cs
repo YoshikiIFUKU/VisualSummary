@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("mmd2pdf")]
-[assembly: AssemblyVersion("1.0.3.0")]
+[assembly: AssemblyVersion("1.0.4.0")]
 
 static class Program
 {
@@ -81,6 +81,13 @@ static class Program
     const uint CREATE_NO_WINDOW = 0x08000000;
     const int WTSActive = 0;
     const uint CREATE_BREAKAWAY_FROM_JOB = 0x01000000;
+
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]
+    static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("kernel32.dll")]
+    static extern bool FreeConsole();
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
@@ -171,47 +178,58 @@ static class Program
                 env = IntPtr.Zero;
             }
             string exe = Assembly.GetExecutingAssembly().Location;
-            var cmd = new StringBuilder();
-            cmd.Append(Quote(exe)).Append(' ').Append(Quote(inFile))
+            string dir = Path.GetDirectoryName(exe);
+            var childArgs = new StringBuilder();
+            childArgs.Append(Quote(inFile))
                .Append(" -o ").Append(Quote(output))
                .Append(" --overwrite --theme ").Append(theme)
                .Append(" --child-result ").Append(Quote(resultFile));
-            if (!open) cmd.Append(" --no-open");
+            if (!open) childArgs.Append(" --no-open");
 
-            Log("SYSTEM アカウントで実行されているため、ログイン中のユーザー（セッション " + session + "）として実行し直します。");
-            var si = new STARTUPINFO();
-            si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
-            si.lpDesktop = @"winsta0\default";
-            PROCESS_INFORMATION pi;
-            // 呼び出し元のジョブオブジェクトの制限を受けないよう、まずジョブから切り離して起動する（許可されていなければ切り離さずに起動）
-            uint flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
-            string dir = Path.GetDirectoryName(exe);
-            bool started = CreateProcessAsUser(primary, exe, new StringBuilder(cmd.ToString()), IntPtr.Zero, IntPtr.Zero, false,
-                flags | CREATE_BREAKAWAY_FROM_JOB, env, dir, ref si, out pi);
-            if (started) Log("ジョブオブジェクトから切り離して起動しました。");
+            string userName;
+            using (var wi = new WindowsIdentity(primary)) userName = wi.Name;
+            Log("SYSTEM アカウントで実行されているため、ログイン中のユーザー " + userName + "（セッション " + session + "）として実行し直します。");
+
+            // まずタスクスケジューラー経由で起動する（ユーザーが自分で起動したのとほぼ同じ環境になる）
+            uint code;
+            int? taskCode = RunViaTaskScheduler(userName, exe, childArgs.ToString(), dir, resultFile);
+            if (taskCode.HasValue) code = (uint)taskCode.Value;
             else
             {
-                Log(Win32Message("ジョブオブジェクトから切り離して起動できなかったため、切り離さずに起動します"));
-                started = CreateProcessAsUser(primary, exe, new StringBuilder(cmd.ToString()), IntPtr.Zero, IntPtr.Zero, false,
-                    flags, env, dir, ref si, out pi);
-            }
-            if (!started)
-                return Fail(Win32Message("ログイン中のユーザーとして起動できませんでした"));
-
-            uint code;
-            try
-            {
-                if (WaitForSingleObject(pi.hProcess, 300000) != 0)
+                Log("タスクスケジューラーで起動できなかったため、ユーザーとして直接起動します。");
+                string cmd = Quote(exe) + " " + childArgs;
+                var si = new STARTUPINFO();
+                si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+                si.lpDesktop = @"winsta0\default";
+                PROCESS_INFORMATION pi;
+                // 呼び出し元のジョブオブジェクトの制限を受けないよう、まずジョブから切り離して起動する（許可されていなければ切り離さずに起動）
+                uint flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+                bool started = CreateProcessAsUser(primary, exe, new StringBuilder(cmd), IntPtr.Zero, IntPtr.Zero, false,
+                    flags | CREATE_BREAKAWAY_FROM_JOB, env, dir, ref si, out pi);
+                if (started) Log("ジョブオブジェクトから切り離して起動しました。");
+                else
                 {
-                    TerminateProcess(pi.hProcess, 1);
-                    return Fail("ログイン中のユーザーとして実行した処理がタイムアウトしました。");
+                    Log(Win32Message("ジョブオブジェクトから切り離して起動できなかったため、切り離さずに起動します"));
+                    started = CreateProcessAsUser(primary, exe, new StringBuilder(cmd), IntPtr.Zero, IntPtr.Zero, false,
+                        flags, env, dir, ref si, out pi);
                 }
-                GetExitCodeProcess(pi.hProcess, out code);
-            }
-            finally
-            {
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
+                if (!started)
+                    return Fail(Win32Message("ログイン中のユーザーとして起動できませんでした"));
+
+                try
+                {
+                    if (WaitForSingleObject(pi.hProcess, 300000) != 0)
+                    {
+                        TerminateProcess(pi.hProcess, 1);
+                        return Fail("ログイン中のユーザーとして実行した処理がタイムアウトしました。");
+                    }
+                    GetExitCodeProcess(pi.hProcess, out code);
+                }
+                finally
+                {
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
+                }
             }
 
             string result = File.Exists(resultFile) ? File.ReadAllText(resultFile, Encoding.UTF8).TrimEnd() : "（結果ファイルがありません）";
@@ -239,7 +257,100 @@ static class Program
             if (userToken != IntPtr.Zero) CloseHandle(userToken);
             try { if (inFile != null) File.Delete(inFile); } catch { }
             try { if (resultFile != null) File.Delete(resultFile); } catch { }
+            try { if (resultFile != null) File.Delete(resultFile + ".tmp"); } catch { }
         }
+    }
+
+    // タスクスケジューラーで、ログイン中のユーザーとして（対話型トークンで）子プロセスを実行する。
+    // タスクを登録・実行できなかった場合は null、実行した場合は子プロセスの終了コードを返す。タスクは最後に必ず削除する
+    static int? RunViaTaskScheduler(string userName, string exe, string arguments, string dir, string resultFile)
+    {
+        string name = "mmd2pdf_" + Guid.NewGuid().ToString("N");
+        string xmlFile = Path.Combine(Path.GetTempPath(), name + ".xml");
+        string xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
+            "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n" +
+            "  <RegistrationInfo><Description>mmd2pdf の一時タスク（実行後に自動で削除されます）</Description></RegistrationInfo>\r\n" +
+            "  <Principals><Principal id=\"Author\"><UserId>" + XmlEscape(userName) + "</UserId>" +
+            "<LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n" +
+            "  <Settings><MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>" +
+            "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" +
+            "<ExecutionTimeLimit>PT10M</ExecutionTimeLimit><Hidden>true</Hidden><Priority>5</Priority></Settings>\r\n" +
+            "  <Actions Context=\"Author\"><Exec><Command>" + XmlEscape(exe) + "</Command>" +
+            "<Arguments>" + XmlEscape(arguments) + "</Arguments>" +
+            "<WorkingDirectory>" + XmlEscape(dir) + "</WorkingDirectory></Exec></Actions>\r\n" +
+            "</Task>\r\n";
+        bool created = false, finished = false;
+        try
+        {
+            File.WriteAllText(xmlFile, xml, Encoding.Unicode);
+            string outText;
+            if (Schtasks("/Create /TN " + Quote(name) + " /XML " + Quote(xmlFile) + " /F", out outText) != 0)
+            {
+                Log("タスクを登録できませんでした: " + outText);
+                return null;
+            }
+            created = true;
+            if (Schtasks("/Run /TN " + Quote(name), out outText) != 0)
+            {
+                Log("タスクを実行できませんでした: " + outText);
+                return null;
+            }
+            Log("タスクスケジューラーでユーザーとして起動しました（タスク名: " + name + "）。");
+
+            // 子プロセスは終了時に結果ファイルを書き出す（一時ファイルから名前を変えるので、見つかった時点で書き込みは完了している）
+            var sw = Stopwatch.StartNew();
+            while (sw.Elapsed.TotalSeconds < 300)
+            {
+                if (File.Exists(resultFile))
+                {
+                    finished = true;
+                    MatchCollection ms = Regex.Matches(File.ReadAllText(resultFile, Encoding.UTF8), @"^終了コード: (-?\d+)\r?$", RegexOptions.Multiline);
+                    return ms.Count > 0 ? int.Parse(ms[ms.Count - 1].Groups[1].Value) : 1;
+                }
+                System.Threading.Thread.Sleep(500);
+            }
+            Log("タスクスケジューラーで起動した処理が 300 秒以内に終わりませんでした。");
+            return 1;
+        }
+        catch (Exception e)
+        {
+            Log("タスクスケジューラーでの起動中にエラーが発生しました: " + e.Message);
+            return created ? (int?)1 : null;
+        }
+        finally
+        {
+            string ignored;
+            if (created && !finished) Schtasks("/End /TN " + Quote(name), out ignored);
+            if (created) Schtasks("/Delete /TN " + Quote(name) + " /F", out ignored);
+            try { File.Delete(xmlFile); } catch { }
+        }
+    }
+
+    static int Schtasks(string arguments, out string output)
+    {
+        var psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "schtasks.exe"), arguments)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.Default,
+            StandardErrorEncoding = Encoding.Default
+        };
+        using (var p = Process.Start(psi))
+        {
+            var err = p.StandardError.ReadToEndAsync();
+            string o = p.StandardOutput.ReadToEnd();
+            p.WaitForExit();
+            output = (o + " " + err.Result).Trim();
+            return p.ExitCode;
+        }
+    }
+
+    static string XmlEscape(string s)
+    {
+        return System.Security.SecurityElement.Escape(s);
     }
 
     static string BuildLogBlock(string[] args, int code)
@@ -264,12 +375,29 @@ static class Program
         logPath = FindLogPath(args);
         int ci = Array.IndexOf(args, "--child-result");
         if (ci >= 0 && ci + 1 < args.Length) childResultPath = args[ci + 1];
+        if (childResultPath != null)
+        {
+            // 子プロセス（タスクスケジューラーなどから起動）はコンソール画面を使わないので、すぐに隠して切り離す
+            IntPtr w = GetConsoleWindow();
+            if (w != IntPtr.Zero) ShowWindow(w, 0 /* SW_HIDE */);
+            FreeConsole();
+            Console.SetOut(TextWriter.Null);
+            Console.SetError(TextWriter.Null);
+        }
         int code = Run(args);
         WriteLog(args, code);
         // ユーザーとして実行し直された子プロセスは、結果を親（SYSTEM 側）に渡す
         if (childResultPath != null)
         {
-            try { File.WriteAllText(childResultPath, BuildLogBlock(args, code), new UTF8Encoding(false)); } catch { }
+            try
+            {
+                // 親が書きかけのファイルを読まないよう、一時ファイルに書いてから名前を変える
+                string tmp = childResultPath + ".tmp";
+                File.WriteAllText(tmp, BuildLogBlock(args, code), new UTF8Encoding(false));
+                if (File.Exists(childResultPath)) File.Delete(childResultPath);
+                File.Move(tmp, childResultPath);
+            }
+            catch { }
             return code;
         }
         // ダブルクリックやドラッグ＆ドロップで起動した場合、結果を読めるように待つ
