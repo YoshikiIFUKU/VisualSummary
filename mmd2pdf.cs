@@ -12,7 +12,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("mmd2pdf")]
-[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.0.1.0")]
 
 static class Program
 {
@@ -23,7 +23,7 @@ static class Program
 
     static int Main(string[] args)
     {
-        Console.OutputEncoding = Encoding.UTF8;
+        ConfigureOutput(args);
         int code = Run(args);
         // ダブルクリックやドラッグ＆ドロップで起動した場合、結果を読めるように待つ
         if (code != 0 && OwnsConsole() && !Console.IsInputRedirected)
@@ -33,6 +33,30 @@ static class Program
             Console.ReadKey(true);
         }
         return code;
+    }
+
+    static Encoding ParseEncoding(string name)
+    {
+        switch (name.ToLowerInvariant())
+        {
+            case "utf8": case "utf-8": return new UTF8Encoding(false);
+            case "sjis": case "shift_jis": case "cp932": return Encoding.GetEncoding(932);
+            default: return null;
+        }
+    }
+
+    // 標準出力・標準エラーが他のプログラムに渡される（リダイレクトされる）場合は、
+    // コンソールの設定に左右されないよう、既定でシステムの ANSI コードページ（日本語 Windows では Shift_JIS）で書き出す。
+    // --encoding で明示指定もできる。画面に直接出す場合はコンソールの設定のまま
+    static void ConfigureOutput(string[] args)
+    {
+        Encoding enc = Encoding.Default;
+        int i = Array.FindIndex(args, a => a == "-e" || a == "--encoding");
+        if (i >= 0 && i + 1 < args.Length && ParseEncoding(args[i + 1]) != null) enc = ParseEncoding(args[i + 1]);
+        if (Console.IsOutputRedirected)
+            Console.SetOut(new StreamWriter(Console.OpenStandardOutput(), enc) { AutoFlush = true });
+        if (Console.IsErrorRedirected)
+            Console.SetError(new StreamWriter(Console.OpenStandardError(), enc) { AutoFlush = true });
     }
 
     static bool OwnsConsole()
@@ -59,9 +83,15 @@ static class Program
                 theme = args[i].ToLowerInvariant();
                 if (Array.IndexOf(Themes, theme) < 0) return Usage("未対応のテーマです: " + args[i]);
             }
+            else if (a == "-e" || a == "--encoding")
+            {
+                if (++i >= args.Length) return Usage("--encoding の後に utf8 または sjis を指定してください。");
+                if (ParseEncoding(args[i]) == null) return Usage("未対応の文字コードです: " + args[i]);
+            }
             else if (a == "--no-open") open = false;
             else if (a == "-y" || a == "--overwrite") overwrite = true;
             else if (a == "-h" || a == "--help" || a == "/?") { Usage(null); return 0; }
+            else if (a.Length > 1 && a[0] == '-') return Usage("不明なオプションです: " + a);
             else if (input == null) input = a;
             else return Usage("引数が多すぎます: " + a);
         }
@@ -313,6 +343,8 @@ html,body{margin:0;padding:0;background:__BG__;-webkit-print-color-adjust:exact;
                  標準入力の場合はカレントフォルダの diagram.pdf）
   -y, --overwrite  出力 PDF が既にあれば上書きする（指定しない場合はエラー）
   -t, --theme    default / neutral / dark / forest / base（省略時は default）
+  -e, --encoding メッセージをリダイレクトで受け取る場合の文字コード utf8 / sjis
+                 （省略時はシステム既定。日本語 Windows では Shift_JIS）
   --no-open      生成後に PDF を開かない
 
 動作環境: Windows 10/11（Microsoft Edge を使用。追加インストール不要）");
