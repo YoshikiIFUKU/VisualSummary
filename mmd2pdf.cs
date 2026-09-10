@@ -199,6 +199,13 @@ static class Program
         string done = "PDF を生成しました（" + diagrams.Count + " ページ）: " + output;
         Console.WriteLine(done);
         Log("結果: " + done);
+        if (open && !Environment.UserInteractive)
+        {
+            // サービスなど非対話セッションから起動された場合、PDF を開いてもユーザーの画面には表示されない
+            Console.Error.WriteLine("非対話セッション（サービスなど）で実行されているため、PDF は開きません。");
+            Log("注意: 非対話セッションで実行されているため、PDF は開きませんでした。");
+            open = false;
+        }
         if (open)
         {
             try { Process.Start(new ProcessStartInfo(output) { UseShellExecute = true }); }
@@ -261,8 +268,27 @@ static class Program
 
     static string RenderPdf(string edge, string html, string pdf, string profile)
     {
+        string err = RunEdge(edge, html, pdf, profile + "1", false);
+        if (err == null) return null;
+        // サービス（SYSTEM アカウントなど）で実行すると Edge のサンドボックスが起動に失敗しやすいため、無効にして再試行する
+        Log("1 回目の Edge 実行で PDF を生成できなかったため、--no-sandbox を付けて再試行します。");
+        string err2 = RunEdge(edge, html, pdf, profile + "2", true);
+        if (err2 == null)
+        {
+            Log("--no-sandbox での再試行で PDF を生成できました。");
+            return null;
+        }
+        return "PDF の生成に失敗しました。" + Environment.NewLine +
+            "  [1 回目]" + err + Environment.NewLine +
+            "  [2 回目: --no-sandbox]" + err2;
+    }
+
+    // Edge で PDF を 1 回生成する。成功なら null、失敗なら原因調査用の詳細を返す
+    static string RunEdge(string edge, string html, string pdf, string profile, bool noSandbox)
+    {
         string arguments = string.Format(
             "--headless --disable-gpu --no-first-run --no-default-browser-check --disable-extensions " +
+            "--enable-logging=stderr --v=0 " + (noSandbox ? "--no-sandbox " : "") +
             "--no-pdf-header-footer --virtual-time-budget=20000 --user-data-dir=\"{0}\" --print-to-pdf=\"{1}\" \"{2}\"",
             profile, pdf, new Uri(html).AbsoluteUri);
         var psi = new ProcessStartInfo(edge, arguments)
@@ -288,13 +314,13 @@ static class Program
             if (!p.WaitForExit(90000))
             {
                 try { p.Kill(); } catch { }
-                return "Edge での PDF 生成がタイムアウトしました。" + EdgeDetail(edge, pdf, null, log);
+                return "（90 秒でタイムアウト）" + EdgeDetail(edge, pdf, null, log);
             }
             p.WaitForExit(); // 非同期で読んでいる出力を最後まで受け取る
             exitCode = p.ExitCode;
         }
         if (!File.Exists(pdf) || new FileInfo(pdf).Length == 0)
-            return "PDF の生成に失敗しました。" + EdgeDetail(edge, pdf, exitCode, log);
+            return EdgeDetail(edge, pdf, exitCode, log);
         return null;
     }
 
