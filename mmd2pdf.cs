@@ -205,20 +205,51 @@ static class Program
             RedirectStandardError = true,
             RedirectStandardOutput = true
         };
+        // 失敗時の原因調査用に Edge の出力を残しておく
+        var log = new List<string>();
+        DataReceivedEventHandler collect = delegate(object sender, DataReceivedEventArgs e)
+        {
+            if (!string.IsNullOrWhiteSpace(e.Data)) lock (log) log.Add(e.Data.Trim());
+        };
+        int exitCode;
         using (var p = Process.Start(psi))
         {
-            p.OutputDataReceived += delegate { };
-            p.ErrorDataReceived += delegate { };
+            p.OutputDataReceived += collect;
+            p.ErrorDataReceived += collect;
             p.BeginOutputReadLine();
             p.BeginErrorReadLine();
             if (!p.WaitForExit(90000))
             {
                 try { p.Kill(); } catch { }
-                return "Edge での PDF 生成がタイムアウトしました。";
+                return "Edge での PDF 生成がタイムアウトしました。" + EdgeDetail(edge, pdf, null, log);
+            }
+            p.WaitForExit(); // 非同期で読んでいる出力を最後まで受け取る
+            exitCode = p.ExitCode;
+        }
+        if (!File.Exists(pdf) || new FileInfo(pdf).Length == 0)
+            return "PDF の生成に失敗しました。" + EdgeDetail(edge, pdf, exitCode, log);
+        return null;
+    }
+
+    static string EdgeDetail(string edge, string pdf, int? exitCode, List<string> log)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine();
+        sb.AppendLine("  Edge: " + edge);
+        sb.AppendLine("  出力先: " + pdf);
+        if (exitCode.HasValue) sb.AppendLine("  Edge の終了コード: " + exitCode.Value);
+        sb.AppendLine("  実行ユーザー: " + Environment.UserDomainName + "\\" + Environment.UserName +
+            (Environment.UserInteractive ? "" : "（非対話セッション）"));
+        lock (log)
+        {
+            if (log.Count == 0) sb.Append("  Edge からの出力はありませんでした。");
+            else
+            {
+                sb.AppendLine("  Edge からの出力（最後の " + Math.Min(log.Count, 15) + " 行）:");
+                for (int i = Math.Max(0, log.Count - 15); i < log.Count; i++) sb.AppendLine("    " + log[i]);
             }
         }
-        if (!File.Exists(pdf) || new FileInfo(pdf).Length == 0) return "PDF の生成に失敗しました。";
-        return null;
+        return sb.ToString().TrimEnd();
     }
 
     static string BuildHtml(List<string> diagrams, string theme)
