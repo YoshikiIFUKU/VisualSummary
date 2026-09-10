@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("mmd2pdf")]
-[assembly: AssemblyVersion("1.0.2.0")]
+[assembly: AssemblyVersion("1.0.3.0")]
 
 static class Program
 {
@@ -80,6 +80,24 @@ static class Program
     const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
     const uint CREATE_NO_WINDOW = 0x08000000;
     const int WTSActive = 0;
+    const uint CREATE_BREAKAWAY_FROM_JOB = 0x01000000;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+
+    // 自分がジョブオブジェクト内で動いているか（サービスが子プロセスをジョブで管理していると Edge が制限を受けることがある）
+    static string JobState()
+    {
+        try
+        {
+            bool inJob;
+            if (IsProcessInJob(GetCurrentProcess(), IntPtr.Zero, out inJob)) return inJob ? "あり" : "なし";
+        }
+        catch { }
+        return "不明";
+    }
 
     // 子プロセスとして実行されているとき、結果を書き出すファイル
     static string childResultPath;
@@ -146,7 +164,12 @@ static class Program
             resultFile = Path.Combine(temp, "mmd2pdf_" + id + ".result");
             File.WriteAllBytes(inFile, raw);
 
-            if (!CreateEnvironmentBlock(out env, primary, false)) env = IntPtr.Zero;
+            Log("ジョブオブジェクト内で実行: " + JobState());
+            if (!CreateEnvironmentBlock(out env, primary, false))
+            {
+                Log(Win32Message("ユーザーの環境変数を作成できなかったため、現在の環境変数で起動します"));
+                env = IntPtr.Zero;
+            }
             string exe = Assembly.GetExecutingAssembly().Location;
             var cmd = new StringBuilder();
             cmd.Append(Quote(exe)).Append(' ').Append(Quote(inFile))
@@ -160,8 +183,19 @@ static class Program
             si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
             si.lpDesktop = @"winsta0\default";
             PROCESS_INFORMATION pi;
-            if (!CreateProcessAsUser(primary, exe, cmd, IntPtr.Zero, IntPtr.Zero, false,
-                    CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, env, Path.GetDirectoryName(exe), ref si, out pi))
+            // 呼び出し元のジョブオブジェクトの制限を受けないよう、まずジョブから切り離して起動する（許可されていなければ切り離さずに起動）
+            uint flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+            string dir = Path.GetDirectoryName(exe);
+            bool started = CreateProcessAsUser(primary, exe, new StringBuilder(cmd.ToString()), IntPtr.Zero, IntPtr.Zero, false,
+                flags | CREATE_BREAKAWAY_FROM_JOB, env, dir, ref si, out pi);
+            if (started) Log("ジョブオブジェクトから切り離して起動しました。");
+            else
+            {
+                Log(Win32Message("ジョブオブジェクトから切り離して起動できなかったため、切り離さずに起動します"));
+                started = CreateProcessAsUser(primary, exe, new StringBuilder(cmd.ToString()), IntPtr.Zero, IntPtr.Zero, false,
+                    flags, env, dir, ref si, out pi);
+            }
+            if (!started)
                 return Fail(Win32Message("ログイン中のユーザーとして起動できませんでした"));
 
             uint code;
@@ -479,6 +513,11 @@ static class Program
 
     static string RenderPdf(string edge, string html, string pdf, string profile)
     {
+        string edgeVersion;
+        try { edgeVersion = FileVersionInfo.GetVersionInfo(edge).FileVersion; } catch { edgeVersion = "不明"; }
+        Log("実行環境: Edge " + edgeVersion + "、ジョブオブジェクト内: " + JobState() +
+            "、TEMP=" + Path.GetTempPath() + "、LOCALAPPDATA=" + Environment.GetEnvironmentVariable("LOCALAPPDATA") +
+            "、USERPROFILE=" + Environment.GetEnvironmentVariable("USERPROFILE"));
         string err = RunEdge(edge, html, pdf, profile + "1", false);
         if (err == null) return null;
         // サービス（SYSTEM アカウントなど）で実行すると Edge のサンドボックスが起動に失敗しやすいため、無効にして再試行する
@@ -541,7 +580,9 @@ static class Program
         sb.AppendLine();
         sb.AppendLine("  Edge: " + edge);
         sb.AppendLine("  出力先: " + pdf);
-        if (exitCode.HasValue) sb.AppendLine("  Edge の終了コード: " + exitCode.Value);
+        if (exitCode.HasValue)
+            sb.AppendLine("  Edge の終了コード: " + exitCode.Value + "（0x" + ((uint)exitCode.Value).ToString("X8") + "）" +
+                ((uint)exitCode.Value == 0xC0000005 ? " アクセス違反で Edge が異常終了しました" : ""));
         sb.AppendLine("  実行ユーザー: " + Environment.UserDomainName + "\\" + Environment.UserName +
             (Environment.UserInteractive ? "" : "（非対話セッション）"));
         lock (log)
