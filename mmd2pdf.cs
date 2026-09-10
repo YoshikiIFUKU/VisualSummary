@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("mmd2pdf")]
-[assembly: AssemblyVersion("1.0.4.0")]
+[assembly: AssemblyVersion("1.0.5.0")]
 
 static class Program
 {
@@ -557,12 +557,24 @@ static class Program
             string html = Path.Combine(work, "diagram.html");
             File.WriteAllText(html, BuildHtml(diagrams, theme), new UTF8Encoding(false));
 
-            try { if (File.Exists(output)) File.Delete(output); }
-            catch (IOException) { return Fail("出力先の PDF が他のアプリで開かれているため上書きできません: " + output); }
-            Directory.CreateDirectory(Path.GetDirectoryName(output));
-
-            string err = RenderPdf(edge, html, output, Path.Combine(work, "profile"));
+            // Edge には一時フォルダへ書き出させ、完成した PDF を出力先にコピーする
+            // （OneDrive などの同期フォルダや日本語・記号を含むパスへ Edge が直接書き込むと失敗する環境があるため）
+            string tempPdf = Path.Combine(work, "diagram.pdf");
+            string err = RenderPdf(edge, html, tempPdf, Path.Combine(work, "profile"));
             if (err != null) return Fail(err);
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(output));
+                File.Copy(tempPdf, output, true);
+            }
+            catch (IOException e)
+            {
+                return Fail("出力先に PDF を書き込めませんでした（他のアプリで開いている可能性があります）: " + output + "（" + e.Message + "）");
+            }
+            catch (UnauthorizedAccessException e)
+            {
+                return Fail("出力先に PDF を書き込む権限がありません: " + output + "（" + e.Message + "）");
+            }
         }
         finally
         {
