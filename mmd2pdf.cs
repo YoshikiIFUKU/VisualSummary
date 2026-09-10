@@ -3,21 +3,224 @@
 // 描画: exe に埋め込んだ mermaid.js を、Windows 標準の Microsoft Edge（ヘッドレス）で実行して PDF 化する
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("mmd2pdf")]
-[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyVersion("1.0.2.0")]
 
 static class Program
 {
     [DllImport("kernel32.dll")]
     static extern uint GetConsoleProcessList(uint[] list, uint count);
+
+    // ---- SYSTEM からログイン中のユーザーとして実行し直すための Win32 API ----
+    [DllImport("kernel32.dll")]
+    static extern uint WTSGetActiveConsoleSessionId();
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    static extern bool WTSQueryUserToken(uint sessionId, out IntPtr token);
+    [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool WTSEnumerateSessions(IntPtr server, int reserved, int version, out IntPtr info, out int count);
+    [DllImport("wtsapi32.dll")]
+    static extern void WTSFreeMemory(IntPtr memory);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr attributes, int impersonationLevel, int tokenType, out IntPtr newToken);
+    [DllImport("userenv.dll", SetLastError = true)]
+    static extern bool CreateEnvironmentBlock(out IntPtr env, IntPtr token, bool inherit);
+    [DllImport("userenv.dll", SetLastError = true)]
+    static extern bool DestroyEnvironmentBlock(IntPtr env);
+    [DllImport("userenv.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool GetUserProfileDirectory(IntPtr token, StringBuilder path, ref uint size);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool CreateProcessAsUser(IntPtr token, string application, StringBuilder commandLine, IntPtr processAttributes,
+        IntPtr threadAttributes, bool inheritHandles, uint flags, IntPtr env, string currentDirectory,
+        ref STARTUPINFO startupInfo, out PROCESS_INFORMATION processInfo);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool TerminateProcess(IntPtr process, uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr handle);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFO
+    {
+        public int cb;
+        public string lpReserved, lpDesktop, lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2;
+        public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess, hThread;
+        public int dwProcessId, dwThreadId;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct WTS_SESSION_INFO
+    {
+        public int SessionId;
+        public string WinStationName;
+        public int State;
+    }
+
+    const uint MAXIMUM_ALLOWED = 0x02000000;
+    const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+    const uint CREATE_NO_WINDOW = 0x08000000;
+    const int WTSActive = 0;
+
+    // 子プロセスとして実行されているとき、結果を書き出すファイル
+    static string childResultPath;
+
+    // ログイン中のユーザーのトークンを取得する（物理コンソールのセッションを優先し、なければリモートデスクトップなどの有効なセッション）
+    static bool QueryActiveUserToken(out IntPtr token, out uint session)
+    {
+        session = WTSGetActiveConsoleSessionId();
+        if (session != 0xFFFFFFFF && WTSQueryUserToken(session, out token)) return true;
+        token = IntPtr.Zero;
+        IntPtr info;
+        int count;
+        if (!WTSEnumerateSessions(IntPtr.Zero, 0, 1, out info, out count)) return false;
+        try
+        {
+            int size = Marshal.SizeOf(typeof(WTS_SESSION_INFO));
+            for (int i = 0; i < count; i++)
+            {
+                var s = (WTS_SESSION_INFO)Marshal.PtrToStructure(new IntPtr(info.ToInt64() + i * size), typeof(WTS_SESSION_INFO));
+                if (s.State == WTSActive && WTSQueryUserToken((uint)s.SessionId, out token))
+                {
+                    session = (uint)s.SessionId;
+                    return true;
+                }
+            }
+        }
+        finally { WTSFreeMemory(info); }
+        return false;
+    }
+
+    static string Win32Message(string what)
+    {
+        return what + "（" + new Win32Exception(Marshal.GetLastWin32Error()).Message + "）";
+    }
+
+    static string Quote(string s)
+    {
+        return "\"" + s + "\"";
+    }
+
+    // SYSTEM から、ログイン中のユーザーとして自分自身を起動し直し、PDF の生成と表示を任せる
+    static int RunInUserSession(byte[] raw, string output, string theme, bool open)
+    {
+        IntPtr userToken = IntPtr.Zero, primary = IntPtr.Zero, env = IntPtr.Zero;
+        string inFile = null, resultFile = null;
+        try
+        {
+            uint session;
+            if (!QueryActiveUserToken(out userToken, out session))
+                return Fail("SYSTEM アカウントでは Edge を起動できないため、ログイン中のユーザーとして実行しようとしましたが、" +
+                    "ログインしているユーザーが見つかりませんでした。" + Win32Message(""));
+            if (!DuplicateTokenEx(userToken, MAXIMUM_ALLOWED, IntPtr.Zero, 2 /* SecurityImpersonation */, 1 /* TokenPrimary */, out primary))
+                return Fail(Win32Message("ユーザーのトークンを複製できませんでした"));
+
+            // 入力と結果の受け渡しは、ユーザーが読み書きできるユーザーの一時フォルダで行う
+            var profile = new StringBuilder(260);
+            uint len = (uint)profile.Capacity;
+            if (!GetUserProfileDirectory(primary, profile, ref len))
+                return Fail(Win32Message("ユーザーのプロファイルフォルダを取得できませんでした"));
+            string temp = Path.Combine(profile.ToString(), @"AppData\Local\Temp");
+            Directory.CreateDirectory(temp);
+            string id = Guid.NewGuid().ToString("N");
+            inFile = Path.Combine(temp, "mmd2pdf_" + id + ".in");
+            resultFile = Path.Combine(temp, "mmd2pdf_" + id + ".result");
+            File.WriteAllBytes(inFile, raw);
+
+            if (!CreateEnvironmentBlock(out env, primary, false)) env = IntPtr.Zero;
+            string exe = Assembly.GetExecutingAssembly().Location;
+            var cmd = new StringBuilder();
+            cmd.Append(Quote(exe)).Append(' ').Append(Quote(inFile))
+               .Append(" -o ").Append(Quote(output))
+               .Append(" --overwrite --theme ").Append(theme)
+               .Append(" --child-result ").Append(Quote(resultFile));
+            if (!open) cmd.Append(" --no-open");
+
+            Log("SYSTEM アカウントで実行されているため、ログイン中のユーザー（セッション " + session + "）として実行し直します。");
+            var si = new STARTUPINFO();
+            si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+            si.lpDesktop = @"winsta0\default";
+            PROCESS_INFORMATION pi;
+            if (!CreateProcessAsUser(primary, exe, cmd, IntPtr.Zero, IntPtr.Zero, false,
+                    CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, env, Path.GetDirectoryName(exe), ref si, out pi))
+                return Fail(Win32Message("ログイン中のユーザーとして起動できませんでした"));
+
+            uint code;
+            try
+            {
+                if (WaitForSingleObject(pi.hProcess, 300000) != 0)
+                {
+                    TerminateProcess(pi.hProcess, 1);
+                    return Fail("ログイン中のユーザーとして実行した処理がタイムアウトしました。");
+                }
+                GetExitCodeProcess(pi.hProcess, out code);
+            }
+            finally
+            {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+
+            string result = File.Exists(resultFile) ? File.ReadAllText(resultFile, Encoding.UTF8).TrimEnd() : "（結果ファイルがありません）";
+            Log("---- ユーザーとして実行した結果 ここから ----");
+            Log(result);
+            Log("---- ユーザーとして実行した結果 ここまで ----");
+
+            // 呼び出し元には、子プロセスの結果行・エラー行をそのまま返す
+            bool inError = false;
+            foreach (string l in result.Replace("\r\n", "\n").Split('\n'))
+            {
+                if (l.StartsWith("結果: ")) Console.WriteLine(l.Substring(4));
+                else if (l.StartsWith("エラー: ")) inError = true;
+                else if (l.StartsWith("終了コード: ")) inError = false;
+                if (inError) Console.Error.WriteLine(l);
+            }
+            if (code != 0 && !result.Contains("エラー: "))
+                Console.Error.WriteLine("エラー: ログイン中のユーザーとして実行した処理が失敗しました（終了コード " + code + "）。");
+            return (int)code;
+        }
+        finally
+        {
+            if (env != IntPtr.Zero) DestroyEnvironmentBlock(env);
+            if (primary != IntPtr.Zero) CloseHandle(primary);
+            if (userToken != IntPtr.Zero) CloseHandle(userToken);
+            try { if (inFile != null) File.Delete(inFile); } catch { }
+            try { if (resultFile != null) File.Delete(resultFile); } catch { }
+        }
+    }
+
+    static string BuildLogBlock(string[] args, int code)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  mmd2pdf " + Assembly.GetExecutingAssembly().GetName().Version);
+        sb.AppendLine("引数: " + string.Join(" ", Array.ConvertAll(args, a => a.IndexOf(' ') >= 0 ? "\"" + a + "\"" : a)));
+        sb.AppendLine("実行ユーザー: " + Environment.UserDomainName + "\\" + Environment.UserName +
+            (Environment.UserInteractive ? "" : "（非対話セッション）"));
+        sb.AppendLine("カレントフォルダ: " + Environment.CurrentDirectory);
+        sb.Append(logBody);
+        sb.AppendLine("終了コード: " + code);
+        sb.AppendLine();
+        return sb.ToString();
+    }
 
     static readonly string[] Themes = { "default", "neutral", "dark", "forest", "base" };
 
@@ -25,8 +228,16 @@ static class Program
     {
         ConfigureOutput(args);
         logPath = FindLogPath(args);
+        int ci = Array.IndexOf(args, "--child-result");
+        if (ci >= 0 && ci + 1 < args.Length) childResultPath = args[ci + 1];
         int code = Run(args);
         WriteLog(args, code);
+        // ユーザーとして実行し直された子プロセスは、結果を親（SYSTEM 側）に渡す
+        if (childResultPath != null)
+        {
+            try { File.WriteAllText(childResultPath, BuildLogBlock(args, code), new UTF8Encoding(false)); } catch { }
+            return code;
+        }
         // ダブルクリックやドラッグ＆ドロップで起動した場合、結果を読めるように待つ
         if (code != 0 && OwnsConsole() && !Console.IsInputRedirected)
         {
@@ -83,20 +294,11 @@ static class Program
         if (logPath == null) return;
         try
         {
-            var sb = new StringBuilder();
-            sb.AppendLine("==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  mmd2pdf " + Assembly.GetExecutingAssembly().GetName().Version);
-            sb.AppendLine("引数: " + string.Join(" ", Array.ConvertAll(args, a => a.IndexOf(' ') >= 0 ? "\"" + a + "\"" : a)));
-            sb.AppendLine("実行ユーザー: " + Environment.UserDomainName + "\\" + Environment.UserName +
-                (Environment.UserInteractive ? "" : "（非対話セッション）"));
-            sb.AppendLine("カレントフォルダ: " + Environment.CurrentDirectory);
-            sb.Append(logBody);
-            sb.AppendLine("終了コード: " + code);
-            sb.AppendLine();
             string full = Path.GetFullPath(logPath);
             string dir = Path.GetDirectoryName(full);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
             // BOM 付き UTF-8（新規作成時のみ BOM が入る）にして、メモ帳でも文字化けしないようにする
-            File.AppendAllText(full, sb.ToString(), new UTF8Encoding(true));
+            File.AppendAllText(full, BuildLogBlock(args, code), new UTF8Encoding(true));
         }
         catch (Exception e)
         {
@@ -106,7 +308,7 @@ static class Program
 
     static bool OwnsConsole()
     {
-        try { return GetConsoleProcessList(new uint[2], 2) <= 1; } catch { return false; }
+        try { return GetConsoleProcessList(new uint[2], 2) == 1; } catch { return false; }
     }
 
     static int Run(string[] args)
@@ -132,6 +334,11 @@ static class Program
             {
                 if (++i >= args.Length) return Usage("--encoding の後に utf8 または sjis を指定してください。");
                 if (ParseEncoding(args[i]) == null) return Usage("未対応の文字コードです: " + args[i]);
+            }
+            else if (a == "--child-result")
+            {
+                // 内部用: SYSTEM から起動し直された子プロセスが結果を書き出すファイル
+                if (++i >= args.Length) return Usage("--child-result の後にパスを指定してください。");
             }
             else if (a == "--log")
             {
@@ -170,6 +377,10 @@ static class Program
         output = Path.GetFullPath(output);
         if (File.Exists(output) && !overwrite)
             return Fail("出力先の PDF が既に存在します（上書きするには --overwrite を指定してください）: " + output);
+
+        // SYSTEM アカウントでは Edge が起動しないため、ログイン中のユーザーとして実行し直す
+        if (childResultPath == null && WindowsIdentity.GetCurrent().IsSystem)
+            return RunInUserSession(raw, output, theme, open);
 
         List<string> diagrams = ExtractDiagrams(text);
         if (diagrams.Count == 0) return Fail("Mermaid の図が見つかりません（入力が空です）。");
