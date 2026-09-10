@@ -1,0 +1,13 @@
+gantt
+    title 社内ツール導入スケジュール
+    dateFormat YYYY-MM-DD
+    axisFormat %m/%d
+    section 準備
+        要件ヒアリング      :done,    a1, 2026-09-01, 7d
+        ツール選定          :active,  a2, after a1, 10d
+    section 導入
+        試験運用            :         b1, after a2, 14d
+        マニュアル作成      :         b2, after a2, 10d
+    section 展開
+        全社説明会          :milestone, c1, after b1, 0d
+        本番運用            :         c2, after b1, 30d

@@ -1,0 +1,16 @@
+sequenceDiagram
+    autonumber
+    actor 顧客
+    participant 窓口 as サポート窓口
+    participant 開発 as 開発チーム
+    顧客->>窓口: ログインできないと連絡
+    窓口->>窓口: FAQを確認
+    alt FAQで解決
+        窓口-->>顧客: 手順を案内
+    else 解決しない
+        窓口->>開発: 調査を依頼
+        Note over 開発: ログを確認<br/>原因を特定
+        開発-->>窓口: 修正予定日を回答
+        窓口-->>顧客: 状況と予定日を連絡
+    end
+    顧客-->>窓口: 了解しました

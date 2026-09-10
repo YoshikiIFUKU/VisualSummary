@@ -1,0 +1,24 @@
+erDiagram
+    CUSTOMER ||--o{ ORDER : "する"
+    ORDER ||--|{ ORDER_ITEM : "含む"
+    PRODUCT ||--o{ ORDER_ITEM : "対象"
+    CUSTOMER["顧客"] {
+        int customer_id PK "顧客ID"
+        string name "氏名"
+        string email "メール"
+    }
+    ORDER["注文"] {
+        int order_id PK "注文ID"
+        int customer_id FK "顧客ID"
+        date ordered_on "注文日"
+    }
+    ORDER_ITEM["注文明細"] {
+        int order_id FK "注文ID"
+        int product_id FK "商品ID"
+        int quantity "数量"
+    }
+    PRODUCT["商品"] {
+        int product_id PK "商品ID"
+        string name "商品名"
+        int price "価格"
+    }

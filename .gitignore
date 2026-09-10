@@ -1,0 +1,10 @@
+# ビルド成果物
+*.exe
+# build.bat が自動で取得する
+mermaid.min.js
+# 生成された PDF
+*.pdf
+# ルート直下の手元用入力ファイル（サンプルは samples/ に置く）
+/*.mmd
+/*.md
+!/README.md

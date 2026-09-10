@@ -1,0 +1,23 @@
+flowchart LR
+    subgraph 課題
+        A[問い合わせ対応が遅い]
+        B[担当者ごとに回答がばらつく]
+    end
+    subgraph 対策
+        C[FAQを整備]
+        D[チャットボット導入]
+        E[対応テンプレート作成]
+    end
+    subgraph 効果
+        F([一次回答の時間を短縮])
+        G([回答品質を統一])
+    end
+    A --> C & D
+    B --> E
+    C --> F
+    D --> F
+    E --> G
+    classDef issue fill:#fde2e2,stroke:#d9534f
+    classDef goal fill:#e2f5e2,stroke:#3c9a3c
+    class A,B issue
+    class F,G goal

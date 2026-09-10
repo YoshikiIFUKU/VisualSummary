@@ -1,0 +1,7 @@
+flowchart TD
+    A[会話の開始<br/>exeで図をPDF化したい] --> B{入力形式は？}
+    B -->|XML| C[スキーマ未定のため保留]
+    B -->|Mermaid| D[今回はこちらを採用]
+    D --> E[Windows前提]
+    E --> F[Edgeで描画してPDF化]
+    F --> G((完成))
