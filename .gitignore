@@ -8,3 +8,4 @@ mermaid.min.js
 /*.mmd
 /*.md
 !/README.md
+!/mermaid-prompt.md
