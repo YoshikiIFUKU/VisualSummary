@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("mmd2pdf")]
-[assembly: AssemblyVersion("1.0.7.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
 
 static class Program
 {
@@ -146,7 +146,7 @@ static class Program
     }
 
     // SYSTEM から、ログイン中のユーザーとして自分自身を起動し直し、PDF の生成と表示を任せる
-    static int RunInUserSession(byte[] raw, string output, string theme, bool open, string browser)
+    static int RunInUserSession(byte[] raw, string output, string theme, bool open, string browser, bool htmlOnly)
     {
         IntPtr userToken = IntPtr.Zero, primary = IntPtr.Zero, env = IntPtr.Zero;
         string inFile = null, resultFile = null;
@@ -186,6 +186,7 @@ static class Program
                .Append(" --child-result ").Append(Quote(resultFile));
             if (!open) childArgs.Append(" --no-open");
             if (browser != null) childArgs.Append(" --browser ").Append(Quote(browser));
+            if (htmlOnly) childArgs.Append(" --html");
 
             string userName;
             using (var wi = new WindowsIdentity(primary)) userName = wi.Name;
@@ -498,7 +499,7 @@ static class Program
     static int Run(string[] args)
     {
         string input = null, output = null, theme = "default", browser = null;
-        bool open = true, overwrite = false;
+        bool open = true, overwrite = false, htmlOnly = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -533,6 +534,7 @@ static class Program
             {
                 if (++i >= args.Length) return Usage("--log の後にログファイルのパスを指定してください。");
             }
+            else if (a == "--html") htmlOnly = true;
             else if (a == "--no-open") open = false;
             else if (a == "-y" || a == "--overwrite") overwrite = true;
             else if (a == "-h" || a == "--help" || a == "/?") { Usage(null); return 0; }
@@ -569,29 +571,40 @@ static class Program
 
         // SYSTEM アカウントでは Edge が起動しないため、ログイン中のユーザーとして実行し直す
         if (childResultPath == null && WindowsIdentity.GetCurrent().IsSystem)
-            return RunInUserSession(raw, output, theme, open, browser);
+            return RunInUserSession(raw, output, theme, open, browser, htmlOnly);
 
         List<string> diagrams = ExtractDiagrams(text);
         if (diagrams.Count == 0) return Fail("Mermaid の図が見つかりません（入力が空です）。");
 
+        string htmlContent = BuildHtml(diagrams, theme);
+        if (htmlOnly) return WriteHtmlOutput(htmlContent, output, open, overwrite, "HTML で出力しました");
+
         List<string> browsers = FindBrowsers(browser);
         if (browsers.Count == 0)
-            return Fail(browser != null
-                ? "指定されたブラウザーが見つかりません: " + browser
-                : "Microsoft Edge も Google Chrome も見つかりません。どちらかをインストールしてください。");
+        {
+            if (browser != null) return Fail("指定されたブラウザーが見つかりません: " + browser);
+            Log("Edge も Chrome も見つからないため、HTML で出力します。");
+            return WriteHtmlOutput(htmlContent, output, open, overwrite, "Edge も Chrome も見つからないため、HTML で出力しました");
+        }
 
         string work = Path.Combine(Path.GetTempPath(), "mmd2pdf_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(work);
         try
         {
             string html = Path.Combine(work, "diagram.html");
-            File.WriteAllText(html, BuildHtml(diagrams, theme), new UTF8Encoding(false));
+            File.WriteAllText(html, htmlContent, new UTF8Encoding(false));
 
             // Edge には一時フォルダへ書き出させ、完成した PDF を出力先にコピーする
             // （OneDrive などの同期フォルダや日本語・記号を含むパスへ Edge が直接書き込むと失敗する環境があるため）
             string tempPdf = Path.Combine(work, "diagram.pdf");
             string err = RenderPdf(browsers, html, tempPdf, Path.Combine(work, "profile"));
-            if (err != null) return Fail(err);
+            if (err != null)
+            {
+                // 画面なし起動が使えない環境でも図を見られるよう、HTML として出力して普通のブラウザーで開く
+                Console.Error.WriteLine("エラー: " + err);
+                Log("エラー: " + err);
+                return WriteHtmlOutput(htmlContent, output, open, overwrite, "PDF を生成できなかったため、HTML で出力しました");
+            }
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(output));
@@ -614,19 +627,45 @@ static class Program
         string done = "PDF を生成しました（" + diagrams.Count + " ページ）: " + output;
         Console.WriteLine(done);
         Log("結果: " + done);
-        if (open && !Environment.UserInteractive)
-        {
-            // サービスなど非対話セッションから起動された場合、PDF を開いてもユーザーの画面には表示されない
-            Console.Error.WriteLine("非対話セッション（サービスなど）で実行されているため、PDF は開きません。");
-            Log("注意: 非対話セッションで実行されているため、PDF は開きませんでした。");
-            open = false;
-        }
-        if (open)
-        {
-            try { Process.Start(new ProcessStartInfo(output) { UseShellExecute = true }); }
-            catch (Exception e) { Console.Error.WriteLine("PDF を開けませんでした: " + e.Message); }
-        }
+        OpenFile(output, open);
         return 0;
+    }
+
+    // PDF の代わりに、図を表示できる HTML を出力して開く（ブラウザーの画面なし起動が使えない環境向け）
+    static int WriteHtmlOutput(string htmlContent, string output, bool open, bool overwrite, string reason)
+    {
+        string htmlPath = Path.ChangeExtension(output, ".html");
+        if (File.Exists(htmlPath) && !overwrite)
+            return Fail("出力先の HTML が既に存在します（上書きするには --overwrite を指定してください）: " + htmlPath);
+        try
+        {
+            string dir = Path.GetDirectoryName(htmlPath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            File.WriteAllText(htmlPath, htmlContent, new UTF8Encoding(true));
+        }
+        catch (Exception e)
+        {
+            return Fail("HTML を書き込めませんでした: " + htmlPath + "（" + e.Message + "）");
+        }
+        string done = reason + ": " + htmlPath + "（ブラウザーで開き、Ctrl+P →「PDF として保存」で PDF にできます）";
+        Console.WriteLine(done);
+        Log("結果: " + done);
+        OpenFile(htmlPath, open);
+        return 0;
+    }
+
+    static void OpenFile(string path, bool open)
+    {
+        if (!open) return;
+        if (!Environment.UserInteractive)
+        {
+            // サービスなど非対話セッションから起動された場合、開いてもユーザーの画面には表示されない
+            Console.Error.WriteLine("非対話セッション（サービスなど）で実行されているため、ファイルは開きません。");
+            Log("注意: 非対話セッションで実行されているため、ファイルは開きませんでした。");
+            return;
+        }
+        try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); }
+        catch (Exception e) { Console.Error.WriteLine("ファイルを開けませんでした: " + e.Message); }
     }
 
     static byte[] ReadAll(Stream s)
@@ -725,6 +764,7 @@ static class Program
             "、TEMP=" + Path.GetTempPath() + "、LOCALAPPDATA=" + Environment.GetEnvironmentVariable("LOCALAPPDATA") +
             "、USERPROFILE=" + Environment.GetEnvironmentVariable("USERPROFILE"));
         var detail = new StringBuilder();
+        DateTime started = DateTime.Now;
         int attempt = 0;
         foreach (string browser in browsers)
         {
@@ -747,7 +787,37 @@ static class Program
                 System.Threading.Thread.Sleep(1500); // 直前のブラウザーの終了処理と重ならないよう少し待つ
             }
         }
-        return "PDF の生成に失敗しました。" + detail;
+        return "PDF の生成に失敗しました。" + detail + CrashEventDetail(started);
+    }
+
+    // ブラウザーが異常終了した場合、Windows の「アプリケーション」イベントログから原因（障害モジュール）を拾う
+    static string CrashEventDetail(DateTime since)
+    {
+        try
+        {
+            var sb = new StringBuilder();
+            using (var log = new EventLog("Application"))
+            {
+                int count = log.Entries.Count;
+                for (int i = count - 1; i >= 0 && i > count - 300; i--)
+                {
+                    EventLogEntry e = log.Entries[i];
+                    if (e.TimeGenerated < since.AddMinutes(-2)) break;
+                    if (e.Source != "Application Error" && e.Source != "Windows Error Reporting") continue;
+                    string m = e.Message == null ? "" : e.Message.Replace("\r\n", " ").Replace("\n", " ").Trim();
+                    if (m.IndexOf("msedge", StringComparison.OrdinalIgnoreCase) < 0 &&
+                        m.IndexOf("chrome", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    sb.AppendLine().Append("    ").Append(e.TimeGenerated.ToString("HH:mm:ss")).Append(" ").Append(e.Source).Append(": ").Append(m);
+                    if (sb.Length > 3000) break;
+                }
+            }
+            if (sb.Length == 0) return "";
+            return Environment.NewLine + "  [Windows イベントログ（アプリケーション）の関連エラー]" + sb;
+        }
+        catch (Exception e)
+        {
+            return Environment.NewLine + "  （イベントログを読み取れませんでした: " + e.Message + "）";
+        }
     }
 
     // Edge で PDF を 1 回生成する。成功なら null、失敗なら原因調査用の詳細を返す
@@ -795,19 +865,19 @@ static class Program
     {
         var sb = new StringBuilder();
         sb.AppendLine();
-        sb.AppendLine("  Edge: " + edge);
+        sb.AppendLine("  ブラウザー: " + edge);
         sb.AppendLine("  出力先: " + pdf);
         if (exitCode.HasValue)
-            sb.AppendLine("  Edge の終了コード: " + exitCode.Value + "（0x" + ((uint)exitCode.Value).ToString("X8") + "）" +
-                ((uint)exitCode.Value == 0xC0000005 ? " アクセス違反で Edge が異常終了しました" : ""));
+            sb.AppendLine("  終了コード: " + exitCode.Value + "（0x" + ((uint)exitCode.Value).ToString("X8") + "）" +
+                ((uint)exitCode.Value == 0xC0000005 ? " アクセス違反でブラウザーが異常終了しました" : ""));
         sb.AppendLine("  実行ユーザー: " + Environment.UserDomainName + "\\" + Environment.UserName +
             (Environment.UserInteractive ? "" : "（非対話セッション）"));
         lock (log)
         {
-            if (log.Count == 0) sb.Append("  Edge からの出力はありませんでした。");
+            if (log.Count == 0) sb.Append("  ブラウザーからの出力はありませんでした。");
             else
             {
-                sb.AppendLine("  Edge からの出力（最後の " + Math.Min(log.Count, 15) + " 行）:");
+                sb.AppendLine("  ブラウザーからの出力（最後の " + Math.Min(log.Count, 15) + " 行）:");
                 for (int i = Math.Max(0, log.Count - 15); i < log.Count; i++) sb.AppendLine("    " + log[i]);
             }
         }
@@ -946,6 +1016,8 @@ html,body{margin:0;padding:0;background:__BG__;-webkit-print-color-adjust:exact;
                  （省略時は Edge → Chrome の順に試す）
   --log ファイル  受け取った入力の内容と結果をログファイルに追記する（UTF-8）
                  環境変数 MMD2PDF_LOG にパスを設定しても有効になる
+  --html         PDF ではなく HTML を出力する（出力先の拡張子を .html に変えて保存）
+                 ブラウザーの画面なし起動が使えない環境では、自動でこの形式に切り替わる
   --no-open      生成後に PDF を開かない
 
 動作環境: Windows 10/11（Microsoft Edge を使用。追加インストール不要）");
