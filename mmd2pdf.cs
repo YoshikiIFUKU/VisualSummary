@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("mmd2pdf")]
-[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
 
 static class Program
 {
@@ -145,8 +145,13 @@ static class Program
         return "\"" + s + "\"";
     }
 
+    static string DefaultExtension(bool? pdfMode)
+    {
+        return pdfMode.HasValue && pdfMode.Value ? ".pdf" : ".html";
+    }
+
     // SYSTEM から、ログイン中のユーザーとして自分自身を起動し直し、PDF の生成と表示を任せる
-    static int RunInUserSession(byte[] raw, string output, string theme, bool open, string browser, bool htmlOnly)
+    static int RunInUserSession(byte[] raw, string output, string theme, bool open, string browser, bool wantPdf)
     {
         IntPtr userToken = IntPtr.Zero, primary = IntPtr.Zero, env = IntPtr.Zero;
         string inFile = null, resultFile = null;
@@ -186,7 +191,7 @@ static class Program
                .Append(" --child-result ").Append(Quote(resultFile));
             if (!open) childArgs.Append(" --no-open");
             if (browser != null) childArgs.Append(" --browser ").Append(Quote(browser));
-            if (htmlOnly) childArgs.Append(" --html");
+            childArgs.Append(wantPdf ? " --pdf" : " --html");
 
             string userName;
             using (var wi = new WindowsIdentity(primary)) userName = wi.Name;
@@ -499,7 +504,8 @@ static class Program
     static int Run(string[] args)
     {
         string input = null, output = null, theme = "default", browser = null;
-        bool open = true, overwrite = false, htmlOnly = false;
+        bool open = true, overwrite = false;
+        bool? pdfMode = null; // 未指定なら出力先の拡張子で決める
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -534,7 +540,8 @@ static class Program
             {
                 if (++i >= args.Length) return Usage("--log の後にログファイルのパスを指定してください。");
             }
-            else if (a == "--html") htmlOnly = true;
+            else if (a == "--html") pdfMode = false;
+            else if (a == "--pdf") pdfMode = true;
             else if (a == "--no-open") open = false;
             else if (a == "-y" || a == "--overwrite") overwrite = true;
             else if (a == "-h" || a == "--help" || a == "/?") { Usage(null); return 0; }
@@ -550,14 +557,18 @@ static class Program
         if (input == "-")
         {
             using (var stdin = Console.OpenStandardInput()) raw = ReadAll(stdin);
-            if (output == null) output = Path.Combine(Environment.CurrentDirectory, "diagram.pdf");
+            if (output == null) output = Path.Combine(Environment.CurrentDirectory, "diagram" + DefaultExtension(pdfMode));
         }
         else
         {
             if (!File.Exists(input)) return Fail("入力ファイルが見つかりません: " + input);
             raw = File.ReadAllBytes(input);
-            if (output == null) output = Path.ChangeExtension(Path.GetFullPath(input), ".pdf");
+            if (output == null) output = Path.ChangeExtension(Path.GetFullPath(input), DefaultExtension(pdfMode));
         }
+        // --pdf / --html の指定がなければ、出力先の拡張子で決める（省略時は HTML）
+        bool wantPdf = pdfMode.HasValue
+            ? pdfMode.Value
+            : ".pdf".Equals(Path.GetExtension(output), StringComparison.OrdinalIgnoreCase);
         string encName;
         string text = DecodeText(raw, out encName);
         Log("入力: " + (input == "-" ? "標準入力" : Path.GetFullPath(input)) + "（" + raw.Length + " バイト、文字コード: " + encName + "）");
@@ -566,18 +577,19 @@ static class Program
         Log(text.TrimEnd('\r', '\n'));
         Log("---- 受け取った内容 ここまで ----");
         output = Path.GetFullPath(output);
+        output = Path.ChangeExtension(output, wantPdf ? ".pdf" : ".html");
         if (File.Exists(output) && !overwrite)
-            return Fail("出力先の PDF が既に存在します（上書きするには --overwrite を指定してください）: " + output);
+            return Fail("出力先のファイルが既に存在します（上書きするには --overwrite を指定してください）: " + output);
 
-        // SYSTEM アカウントでは Edge が起動しないため、ログイン中のユーザーとして実行し直す
+        // SYSTEM アカウントではブラウザーが起動しないため、ログイン中のユーザーとして実行し直す
         if (childResultPath == null && WindowsIdentity.GetCurrent().IsSystem)
-            return RunInUserSession(raw, output, theme, open, browser, htmlOnly);
+            return RunInUserSession(raw, output, theme, open, browser, wantPdf);
 
         List<string> diagrams = ExtractDiagrams(text);
         if (diagrams.Count == 0) return Fail("Mermaid の図が見つかりません（入力が空です）。");
 
         string htmlContent = BuildHtml(diagrams, theme);
-        if (htmlOnly) return WriteHtmlOutput(htmlContent, output, open, overwrite, "HTML で出力しました");
+        if (!wantPdf) return WriteHtmlOutput(htmlContent, output, open, overwrite, "HTML を出力しました");
 
         List<string> browsers = FindBrowsers(browser);
         if (browsers.Count == 0)
@@ -992,23 +1004,31 @@ html,body{margin:0;padding:0;background:__BG__;-webkit-print-color-adjust:exact;
             Log("エラー: " + error);
         }
         Console.WriteLine(
-@"mmd2pdf - Mermaid の図を PDF にして開きます
+@"mmd2pdf - Mermaid の図を HTML（または PDF）にして開きます
 
 使い方:
-  mmd2pdf <入力ファイル> [-o 出力.pdf] [--overwrite] [--theme テーマ] [--no-open]
-  mmd2pdf -o 出力.pdf [--overwrite] [--theme テーマ] [--no-open] < 入力
+  mmd2pdf <入力ファイル> [-o 出力.html] [--overwrite] [--theme テーマ] [--no-open]
+  mmd2pdf -o 出力.html [--overwrite] [--theme テーマ] [--no-open] < 入力
       入力ファイルを省略すると標準入力から読み込みます（""-"" を指定しても同じ）
+
+出力形式:
+  既定は HTML です。生成後、既定のブラウザーで開きます。
+  PDF が必要な場合は、出力先の拡張子を .pdf にするか --pdf を指定します
+  （PDF はブラウザーの画面なし起動を使うため、環境によっては生成できません。
+  　その場合は自動で HTML に切り替わります）。
+  ブラウザーで開いたページから Ctrl+P →「PDF として保存」でも PDF にできます。
 
 入力ファイル:
   .mmd などの Mermaid 記法のテキスト、または ```mermaid ブロックを含む Markdown。
-  Markdown に複数の図があれば、1 図 1 ページの PDF になります。
+  Markdown に複数の図があれば、1 図 1 ページになります。
   exe に入力ファイルをドラッグ＆ドロップしても使えます。
   文字コードは UTF-8 / UTF-16 / Shift_JIS を自動判別します。
 
 オプション:
-  -o, --output   出力 PDF のパス（省略時は入力と同じ場所・同じ名前の .pdf、
-                 標準入力の場合はカレントフォルダの diagram.pdf）
-  -y, --overwrite  出力 PDF が既にあれば上書きする（指定しない場合はエラー）
+  -o, --output   出力先のパス（省略時は入力と同じ場所・同じ名前の .html、
+                 標準入力の場合はカレントフォルダの diagram.html）
+                 拡張子が .pdf なら PDF、それ以外は HTML を出力します
+  -y, --overwrite  出力先が既にあれば上書きする（指定しない場合はエラー）
   -t, --theme    default / neutral / dark / forest / base（省略時は default）
   -e, --encoding メッセージをリダイレクトで受け取る場合の文字コード utf8 / sjis
                  （省略時はシステム既定。日本語 Windows では Shift_JIS）
@@ -1016,11 +1036,11 @@ html,body{margin:0;padding:0;background:__BG__;-webkit-print-color-adjust:exact;
                  （省略時は Edge → Chrome の順に試す）
   --log ファイル  受け取った入力の内容と結果をログファイルに追記する（UTF-8）
                  環境変数 MMD2PDF_LOG にパスを設定しても有効になる
-  --html         PDF ではなく HTML を出力する（出力先の拡張子を .html に変えて保存）
-                 ブラウザーの画面なし起動が使えない環境では、自動でこの形式に切り替わる
-  --no-open      生成後に PDF を開かない
+  --html         HTML を出力する（既定）
+  --pdf          PDF を出力する（ブラウザーの画面なし起動を使用）
+  --no-open      生成後にファイルを開かない
 
-動作環境: Windows 10/11（Microsoft Edge を使用。追加インストール不要）");
+動作環境: Windows 10/11（HTML の表示は既定のブラウザー、PDF は Edge / Chrome を使用）");
         return error == null ? 1 : 2;
     }
 
