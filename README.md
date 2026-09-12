@@ -3,6 +3,7 @@
 会話の要約などを [Mermaid](https://mermaid.js.org/) 記法で書いたテキストから図を描き、PDF にして開く Windows 用のコマンドラインツールです。
 
 - exe 単体で動作（.NET Framework 4.x と Microsoft Edge は Windows 10/11 に標準搭載）
+- 描画には Edge を使用。Edge で失敗した場合は Google Chrome があればそちらで再試行（`--browser` で指定も可能）
 - mermaid.js を exe に埋め込んでいるのでオフラインで動作
 - ファイル・標準入力のどちらからでも入力可能
 - Markdown 内の複数の ```` ```mermaid ```` ブロックは 1 図 1 ページの PDF に
@@ -30,6 +31,7 @@ exe に `.mmd` ファイルをドラッグ＆ドロップしても使えます�
 | `-y`, `--overwrite` | 出力 PDF が既にあれば上書きする（指定しない場合はエラー） |
 | `-t`, `--theme` | `default` / `neutral` / `dark` / `forest` / `base` |
 | `-e`, `--encoding` | メッセージをリダイレクトで受け取る場合の文字コード `utf8` / `sjis`（省略時はシステム既定。日本語 Windows では Shift_JIS） |
+| `-b`, `--browser` | 使用するブラウザー。`edge` / `chrome` または実行ファイルのパス（省略時は Edge → Chrome の順に試す） |
 | `--log` | 受け取った入力の内容と結果（エラーの詳細を含む）をログファイルに追記する。環境変数 `MMD2PDF_LOG` にパスを設定しても有効になる |
 | `--no-open` | 生成後に PDF を開かない |
 

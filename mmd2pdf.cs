@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("mmd2pdf")]
-[assembly: AssemblyVersion("1.0.5.0")]
+[assembly: AssemblyVersion("1.0.6.0")]
 
 static class Program
 {
@@ -146,7 +146,7 @@ static class Program
     }
 
     // SYSTEM から、ログイン中のユーザーとして自分自身を起動し直し、PDF の生成と表示を任せる
-    static int RunInUserSession(byte[] raw, string output, string theme, bool open)
+    static int RunInUserSession(byte[] raw, string output, string theme, bool open, string browser)
     {
         IntPtr userToken = IntPtr.Zero, primary = IntPtr.Zero, env = IntPtr.Zero;
         string inFile = null, resultFile = null;
@@ -185,6 +185,7 @@ static class Program
                .Append(" --overwrite --theme ").Append(theme)
                .Append(" --child-result ").Append(Quote(resultFile));
             if (!open) childArgs.Append(" --no-open");
+            if (browser != null) childArgs.Append(" --browser ").Append(Quote(browser));
 
             string userName;
             using (var wi = new WindowsIdentity(primary)) userName = wi.Name;
@@ -475,7 +476,7 @@ static class Program
 
     static int Run(string[] args)
     {
-        string input = null, output = null, theme = "default";
+        string input = null, output = null, theme = "default", browser = null;
         bool open = true, overwrite = false;
 
         for (int i = 0; i < args.Length; i++)
@@ -496,6 +497,11 @@ static class Program
             {
                 if (++i >= args.Length) return Usage("--encoding の後に utf8 または sjis を指定してください。");
                 if (ParseEncoding(args[i]) == null) return Usage("未対応の文字コードです: " + args[i]);
+            }
+            else if (a == "-b" || a == "--browser")
+            {
+                if (++i >= args.Length) return Usage("--browser の後に edge / chrome または実行ファイルのパスを指定してください。");
+                browser = args[i];
             }
             else if (a == "--child-result")
             {
@@ -542,13 +548,16 @@ static class Program
 
         // SYSTEM アカウントでは Edge が起動しないため、ログイン中のユーザーとして実行し直す
         if (childResultPath == null && WindowsIdentity.GetCurrent().IsSystem)
-            return RunInUserSession(raw, output, theme, open);
+            return RunInUserSession(raw, output, theme, open, browser);
 
         List<string> diagrams = ExtractDiagrams(text);
         if (diagrams.Count == 0) return Fail("Mermaid の図が見つかりません（入力が空です）。");
 
-        string edge = FindEdge();
-        if (edge == null) return Fail("Microsoft Edge が見つかりません。Edge をインストールしてください。");
+        List<string> browsers = FindBrowsers(browser);
+        if (browsers.Count == 0)
+            return Fail(browser != null
+                ? "指定されたブラウザーが見つかりません: " + browser
+                : "Microsoft Edge も Google Chrome も見つかりません。どちらかをインストールしてください。");
 
         string work = Path.Combine(Path.GetTempPath(), "mmd2pdf_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(work);
@@ -560,7 +569,7 @@ static class Program
             // Edge には一時フォルダへ書き出させ、完成した PDF を出力先にコピーする
             // （OneDrive などの同期フォルダや日本語・記号を含むパスへ Edge が直接書き込むと失敗する環境があるため）
             string tempPdf = Path.Combine(work, "diagram.pdf");
-            string err = RenderPdf(edge, html, tempPdf, Path.Combine(work, "profile"));
+            string err = RenderPdf(browsers, html, tempPdf, Path.Combine(work, "profile"));
             if (err != null) return Fail(err);
             try
             {
@@ -636,41 +645,88 @@ static class Program
         return list;
     }
 
-    static string FindEdge()
+    static void AddIfExists(List<string> list, string path)
     {
-        var candidates = new List<string>();
-        foreach (var hive in new[] { Registry.LocalMachine, Registry.CurrentUser })
-        {
-            using (var k = hive.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"))
-                if (k != null && k.GetValue(null) is string) candidates.Add(((string)k.GetValue(null)).Trim('"'));
-        }
-        candidates.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"Microsoft\Edge\Application\msedge.exe"));
-        candidates.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"Microsoft\Edge\Application\msedge.exe"));
-        candidates.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Microsoft\Edge\Application\msedge.exe"));
-        foreach (var c in candidates) if (File.Exists(c)) return c;
-        return null;
+        if (!string.IsNullOrEmpty(path) && File.Exists(path) && !list.Contains(path)) list.Add(path);
     }
 
-    static string RenderPdf(string edge, string html, string pdf, string profile)
+    // レジストリの App Paths からブラウザーの場所を探す
+    static void AddAppPath(List<string> list, string exeName)
     {
-        string edgeVersion;
-        try { edgeVersion = FileVersionInfo.GetVersionInfo(edge).FileVersion; } catch { edgeVersion = "不明"; }
-        Log("実行環境: Edge " + edgeVersion + "、ジョブオブジェクト内: " + JobState() +
+        foreach (var hive in new[] { Registry.LocalMachine, Registry.CurrentUser })
+        {
+            using (var k = hive.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\" + exeName))
+                if (k != null && k.GetValue(null) is string) AddIfExists(list, ((string)k.GetValue(null)).Trim('"'));
+        }
+    }
+
+    static List<string> FindEdges()
+    {
+        var list = new List<string>();
+        AddAppPath(list, "msedge.exe");
+        AddIfExists(list, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"Microsoft\Edge\Application\msedge.exe"));
+        AddIfExists(list, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"Microsoft\Edge\Application\msedge.exe"));
+        AddIfExists(list, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Microsoft\Edge\Application\msedge.exe"));
+        return list;
+    }
+
+    static List<string> FindChromes()
+    {
+        var list = new List<string>();
+        AddAppPath(list, "chrome.exe");
+        AddIfExists(list, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"Google\Chrome\Application\chrome.exe"));
+        AddIfExists(list, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"Google\Chrome\Application\chrome.exe"));
+        AddIfExists(list, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Google\Chrome\Application\chrome.exe"));
+        return list;
+    }
+
+    // 使用するブラウザーの候補を優先順（Edge → Chrome）に返す。prefer には edge / chrome または実行ファイルのパスを指定できる
+    static List<string> FindBrowsers(string prefer)
+    {
+        if (prefer != null)
+        {
+            string p = prefer.ToLowerInvariant();
+            if (p == "edge" || p == "msedge") return FindEdges();
+            if (p == "chrome" || p == "google chrome") return FindChromes();
+            var one = new List<string>();
+            AddIfExists(one, prefer);
+            return one;
+        }
+        var list = FindEdges();
+        foreach (string c in FindChromes()) AddIfExists(list, c);
+        return list;
+    }
+
+    // 見つかったブラウザーを順に試す。1 つのブラウザーにつき、通常起動と --no-sandbox の 2 回試す
+    static string RenderPdf(List<string> browsers, string html, string pdf, string profile)
+    {
+        Log("実行環境: ジョブオブジェクト内: " + JobState() +
             "、TEMP=" + Path.GetTempPath() + "、LOCALAPPDATA=" + Environment.GetEnvironmentVariable("LOCALAPPDATA") +
             "、USERPROFILE=" + Environment.GetEnvironmentVariable("USERPROFILE"));
-        string err = RunEdge(edge, html, pdf, profile + "1", false);
-        if (err == null) return null;
-        // サービス（SYSTEM アカウントなど）で実行すると Edge のサンドボックスが起動に失敗しやすいため、無効にして再試行する
-        Log("1 回目の Edge 実行で PDF を生成できなかったため、--no-sandbox を付けて再試行します。");
-        string err2 = RunEdge(edge, html, pdf, profile + "2", true);
-        if (err2 == null)
+        var detail = new StringBuilder();
+        int attempt = 0;
+        foreach (string browser in browsers)
         {
-            Log("--no-sandbox での再試行で PDF を生成できました。");
-            return null;
+            string version;
+            try { version = FileVersionInfo.GetVersionInfo(browser).FileVersion; } catch { version = "不明"; }
+            Log("ブラウザー: " + browser + "（バージョン " + version + "）で試します。");
+            // 同じ指定でも成功したりしなかったりするブラウザーがあるため、通常 → 再試行 → --no-sandbox の順に試す
+            for (int pass = 0; pass < 3; pass++)
+            {
+                attempt++;
+                string label = Path.GetFileName(browser) + (pass == 1 ? "（再試行）" : pass == 2 ? " --no-sandbox" : "");
+                string err = RunEdge(browser, html, pdf, profile + attempt, pass == 2);
+                if (err == null)
+                {
+                    Log("PDF を生成できました（" + label + "）。");
+                    return null;
+                }
+                Log(label + " では PDF を生成できませんでした。");
+                detail.Append(Environment.NewLine).Append("  [").Append(label).Append("]").Append(err);
+                System.Threading.Thread.Sleep(1500); // 直前のブラウザーの終了処理と重ならないよう少し待つ
+            }
         }
-        return "PDF の生成に失敗しました。" + Environment.NewLine +
-            "  [1 回目]" + err + Environment.NewLine +
-            "  [2 回目: --no-sandbox]" + err2;
+        return "PDF の生成に失敗しました。" + detail;
     }
 
     // Edge で PDF を 1 回生成する。成功なら null、失敗なら原因調査用の詳細を返す
@@ -865,6 +921,8 @@ html,body{margin:0;padding:0;background:__BG__;-webkit-print-color-adjust:exact;
   -t, --theme    default / neutral / dark / forest / base（省略時は default）
   -e, --encoding メッセージをリダイレクトで受け取る場合の文字コード utf8 / sjis
                  （省略時はシステム既定。日本語 Windows では Shift_JIS）
+  -b, --browser  使用するブラウザー edge / chrome または実行ファイルのパス
+                 （省略時は Edge → Chrome の順に試す）
   --log ファイル  受け取った入力の内容と結果をログファイルに追記する（UTF-8）
                  環境変数 MMD2PDF_LOG にパスを設定しても有効になる
   --no-open      生成後に PDF を開かない
