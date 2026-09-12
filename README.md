@@ -17,8 +17,8 @@
 ## 使い方
 
 ```bat
-rem ファイルから
-mmd2pdf.exe samples\02_support_sequence.mmd
+rem 入力ファイルを渡すだけ（既定の場所に出力してブラウザーで開く）
+mmd2pdf.exe input.mmd
 
 rem 標準入力から（出力先を指定し、既存ファイルは上書き）
 type input.mmd | mmd2pdf.exe -o "C:\output\summary.html" --overwrite
@@ -31,17 +31,27 @@ exe に `.mmd` ファイルをドラッグ＆ドロップしても使えます�
 
 | オプション | 説明 |
 |---|---|
-| `-o`, `--output` | 出力先のパス。拡張子が `.pdf` なら PDF、それ以外は HTML。省略時は入力と同じ場所・同じ名前の `.html`（標準入力の場合はカレントフォルダの `diagram.html`） |
+| `-o`, `--output` | 出力先のパス。拡張子が `.pdf` なら PDF、それ以外は HTML。省略時は既定の出力先（下記） |
 | `-y`, `--overwrite` | 出力先が既にあれば上書きする（指定しない場合はエラー） |
 | `-t`, `--theme` | `default` / `neutral` / `dark` / `forest` / `base` |
 | `-e`, `--encoding` | メッセージをリダイレクトで受け取る場合の文字コード `utf8` / `sjis`（省略時はシステム既定。日本語 Windows では Shift_JIS） |
 | `-b`, `--browser` | 使用するブラウザー。`edge` / `chrome` または実行ファイルのパス（省略時は Edge → Chrome の順に試す） |
-| `--log` | 受け取った入力の内容と結果（エラーの詳細を含む）をログファイルに追記する。環境変数 `MMD2PDF_LOG` にパスを設定しても有効になる |
+| `--log` | ログの出力先を指定する（省略時は既定の場所に自動で記録）。環境変数 `MMD2PDF_LOG` でも指定できる |
+| `--no-log` | ログを書かない |
 | `--html` | HTML を出力する（既定） |
 | `--pdf` | PDF を出力する（ブラウザーのヘッドレス実行を使用） |
 | `--no-open` | 生成後にファイルを開かない |
 
 入力ファイルを省略すると標準入力から読み込みます（`-` を指定しても同じ）。文字コードは UTF-8 / UTF-16 / Shift_JIS を自動判別します。
+
+### 既定の出力先
+
+`-o` と `--log` を指定しない場合、exe が置かれているフォルダの下に出力します。フォルダがなければ自動で作成します。
+
+| 種類 | 場所 |
+|---|---|
+| 出力 | `<exe のフォルダ>\Result\VisualSummary.html`（`--pdf` 指定時は `.pdf`）。毎回上書き |
+| ログ | `<exe のフォルダ>\Log\mmd2pdf-YYYYMMDD.log`。日付ごとのファイルに追記 |
 
 ### 終了コード
 

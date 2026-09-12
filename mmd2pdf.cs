@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("mmd2pdf")]
-[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
 
 static class Program
 {
@@ -191,7 +191,7 @@ static class Program
                .Append(" --child-result ").Append(Quote(resultFile));
             if (!open) childArgs.Append(" --no-open");
             if (browser != null) childArgs.Append(" --browser ").Append(Quote(browser));
-            childArgs.Append(wantPdf ? " --pdf" : " --html");
+            childArgs.Append(wantPdf ? " --pdf" : " --html").Append(" --no-log");
 
             string userName;
             using (var wi = new WindowsIdentity(primary)) userName = wi.Name;
@@ -386,9 +386,9 @@ static class Program
     static int Main(string[] args)
     {
         ConfigureOutput(args);
-        logPath = FindLogPath(args);
         int ci = Array.IndexOf(args, "--child-result");
         if (ci >= 0 && ci + 1 < args.Length) childResultPath = args[ci + 1];
+        logPath = FindLogPath(args);
         if (childResultPath != null)
         {
             // 子プロセス（タスクスケジューラーなどから起動）はコンソール画面を使わないので、すぐに隠して切り離す
@@ -453,12 +453,29 @@ static class Program
     static string logPath;
     static readonly StringBuilder logBody = new StringBuilder();
 
+    // exe が置かれているフォルダ（出力先・ログの既定の場所）
+    static string ExeDir()
+    {
+        try
+        {
+            string dir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+            if (!string.IsNullOrEmpty(dir)) return dir;
+        }
+        catch { }
+        return Environment.CurrentDirectory;
+    }
+
     static string FindLogPath(string[] args)
     {
+        if (Array.IndexOf(args, "--no-log") >= 0) return null;
         int i = Array.IndexOf(args, "--log");
         if (i >= 0 && i + 1 < args.Length) return args[i + 1];
         string env = Environment.GetEnvironmentVariable("MMD2PDF_LOG");
-        return string.IsNullOrWhiteSpace(env) ? null : env;
+        if (!string.IsNullOrWhiteSpace(env)) return env;
+        // 子プロセスの内容は親のログに記録されるので、二重に書かない
+        if (childResultPath != null) return null;
+        // 既定は exe と同じ場所の Log フォルダに日付ごとのファイル
+        return Path.Combine(ExeDir(), "Log", "mmd2pdf-" + DateTime.Now.ToString("yyyyMMdd") + ".log");
     }
 
     static void Log(string line)
@@ -540,6 +557,7 @@ static class Program
             {
                 if (++i >= args.Length) return Usage("--log の後にログファイルのパスを指定してください。");
             }
+            else if (a == "--no-log") { /* ログを書かない（Main で判定済み） */ }
             else if (a == "--html") pdfMode = false;
             else if (a == "--pdf") pdfMode = true;
             else if (a == "--no-open") open = false;
@@ -557,14 +575,15 @@ static class Program
         if (input == "-")
         {
             using (var stdin = Console.OpenStandardInput()) raw = ReadAll(stdin);
-            if (output == null) output = Path.Combine(Environment.CurrentDirectory, "diagram" + DefaultExtension(pdfMode));
         }
         else
         {
             if (!File.Exists(input)) return Fail("入力ファイルが見つかりません: " + input);
             raw = File.ReadAllBytes(input);
-            if (output == null) output = Path.ChangeExtension(Path.GetFullPath(input), DefaultExtension(pdfMode));
         }
+        // 出力先の指定がなければ、exe と同じ場所の Result フォルダに VisualSummary という名前で出力する
+        bool defaultedOutput = output == null;
+        if (defaultedOutput) output = Path.Combine(ExeDir(), "Result", "VisualSummary" + DefaultExtension(pdfMode));
         // --pdf / --html の指定がなければ、出力先の拡張子で決める（省略時は HTML）
         bool wantPdf = pdfMode.HasValue
             ? pdfMode.Value
@@ -578,6 +597,7 @@ static class Program
         Log("---- 受け取った内容 ここまで ----");
         output = Path.GetFullPath(output);
         output = Path.ChangeExtension(output, wantPdf ? ".pdf" : ".html");
+        if (defaultedOutput) overwrite = true; // 既定の出力先は毎回同じ名前なので、常に上書きする
         if (File.Exists(output) && !overwrite)
             return Fail("出力先のファイルが既に存在します（上書きするには --overwrite を指定してください）: " + output);
 
@@ -1007,9 +1027,14 @@ html,body{margin:0;padding:0;background:__BG__;-webkit-print-color-adjust:exact;
 @"mmd2pdf - Mermaid の図を HTML（または PDF）にして開きます
 
 使い方:
+  mmd2pdf <入力ファイル>
   mmd2pdf <入力ファイル> [-o 出力.html] [--overwrite] [--theme テーマ] [--no-open]
-  mmd2pdf -o 出力.html [--overwrite] [--theme テーマ] [--no-open] < 入力
       入力ファイルを省略すると標準入力から読み込みます（""-"" を指定しても同じ）
+
+既定の出力先（-o と --log を指定しない場合）:
+  出力: <exe のフォルダ>\Result\VisualSummary.html（毎回上書き）
+  ログ: <exe のフォルダ>\Log\mmd2pdf-YYYYMMDD.log（追記）
+  フォルダがなければ自動で作成します。
 
 出力形式:
   既定は HTML です。生成後、既定のブラウザーで開きます。
@@ -1025,8 +1050,7 @@ html,body{margin:0;padding:0;background:__BG__;-webkit-print-color-adjust:exact;
   文字コードは UTF-8 / UTF-16 / Shift_JIS を自動判別します。
 
 オプション:
-  -o, --output   出力先のパス（省略時は入力と同じ場所・同じ名前の .html、
-                 標準入力の場合はカレントフォルダの diagram.html）
+  -o, --output   出力先のパス（省略時は上記の既定の場所）
                  拡張子が .pdf なら PDF、それ以外は HTML を出力します
   -y, --overwrite  出力先が既にあれば上書きする（指定しない場合はエラー）
   -t, --theme    default / neutral / dark / forest / base（省略時は default）
@@ -1034,8 +1058,9 @@ html,body{margin:0;padding:0;background:__BG__;-webkit-print-color-adjust:exact;
                  （省略時はシステム既定。日本語 Windows では Shift_JIS）
   -b, --browser  使用するブラウザー edge / chrome または実行ファイルのパス
                  （省略時は Edge → Chrome の順に試す）
-  --log ファイル  受け取った入力の内容と結果をログファイルに追記する（UTF-8）
-                 環境変数 MMD2PDF_LOG にパスを設定しても有効になる
+  --log ファイル  ログの出力先を指定する（省略時は上記の既定の場所、UTF-8 で追記）
+                 環境変数 MMD2PDF_LOG でも指定できる
+  --no-log       ログを書かない
   --html         HTML を出力する（既定）
   --pdf          PDF を出力する（ブラウザーの画面なし起動を使用）
   --no-open      生成後にファイルを開かない

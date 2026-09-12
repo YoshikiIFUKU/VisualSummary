@@ -9,3 +9,6 @@ mermaid.min.js
 /*.md
 !/README.md
 !/mermaid-prompt.md
+# 既定の出力先
+/Result/
+/Log/
