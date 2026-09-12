@@ -14,7 +14,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("mmd2pdf")]
-[assembly: AssemblyVersion("1.0.6.0")]
+[assembly: AssemblyVersion("1.0.7.0")]
 
 static class Program
 {
@@ -219,7 +219,7 @@ static class Program
 
                 try
                 {
-                    if (WaitForSingleObject(pi.hProcess, 300000) != 0)
+                    if (WaitForSingleObject(pi.hProcess, 420000) != 0)
                     {
                         TerminateProcess(pi.hProcess, 1);
                         return Fail("ログイン中のユーザーとして実行した処理がタイムアウトしました。");
@@ -301,7 +301,7 @@ static class Program
 
             // 子プロセスは終了時に結果ファイルを書き出す（一時ファイルから名前を変えるので、見つかった時点で書き込みは完了している）
             var sw = Stopwatch.StartNew();
-            while (sw.Elapsed.TotalSeconds < 300)
+            while (sw.Elapsed.TotalSeconds < 420)
             {
                 if (File.Exists(resultFile))
                 {
@@ -311,7 +311,7 @@ static class Program
                 }
                 System.Threading.Thread.Sleep(500);
             }
-            Log("タスクスケジューラーで起動した処理が 300 秒以内に終わりませんでした。");
+            Log("タスクスケジューラーで起動した処理が 420 秒以内に終わりませんでした。");
             return 1;
         }
         catch (Exception e)
@@ -354,7 +354,7 @@ static class Program
         return System.Security.SecurityElement.Escape(s);
     }
 
-    static string BuildLogBlock(string[] args, int code)
+    static string BuildLogHeader(string[] args)
     {
         var sb = new StringBuilder();
         sb.AppendLine("==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  mmd2pdf " + Assembly.GetExecutingAssembly().GetName().Version);
@@ -362,6 +362,13 @@ static class Program
         sb.AppendLine("実行ユーザー: " + Environment.UserDomainName + "\\" + Environment.UserName +
             (Environment.UserInteractive ? "" : "（非対話セッション）"));
         sb.AppendLine("カレントフォルダ: " + Environment.CurrentDirectory);
+        return sb.ToString();
+    }
+
+    static string BuildLogBlock(string[] args, int code)
+    {
+        var sb = new StringBuilder();
+        sb.Append(BuildLogHeader(args));
         sb.Append(logBody);
         sb.AppendLine("終了コード: " + code);
         sb.AppendLine();
@@ -385,6 +392,7 @@ static class Program
             Console.SetOut(TextWriter.Null);
             Console.SetError(TextWriter.Null);
         }
+        WriteLogHeader(args);
         int code = Run(args);
         WriteLog(args, code);
         // ユーザーとして実行し直された子プロセスは、結果を親（SYSTEM 側）に渡す
@@ -450,9 +458,11 @@ static class Program
     static void Log(string line)
     {
         logBody.AppendLine(line);
+        // 実行中でも進み具合が分かるよう、その場でログファイルに書き出す
+        AppendToLogFile(DateTime.Now.ToString("HH:mm:ss") + " " + line + Environment.NewLine);
     }
 
-    static void WriteLog(string[] args, int code)
+    static void AppendToLogFile(string text)
     {
         if (logPath == null) return;
         try
@@ -461,12 +471,23 @@ static class Program
             string dir = Path.GetDirectoryName(full);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
             // BOM 付き UTF-8（新規作成時のみ BOM が入る）にして、メモ帳でも文字化けしないようにする
-            File.AppendAllText(full, BuildLogBlock(args, code), new UTF8Encoding(true));
+            File.AppendAllText(full, text, new UTF8Encoding(true));
         }
         catch (Exception e)
         {
+            logPath = null; // 書き込めない場所なら、以降は書き込まない
             Console.Error.WriteLine("ログを書き込めませんでした: " + e.Message);
         }
+    }
+
+    static void WriteLogHeader(string[] args)
+    {
+        AppendToLogFile(BuildLogHeader(args));
+    }
+
+    static void WriteLog(string[] args, int code)
+    {
+        AppendToLogFile("終了コード: " + code + Environment.NewLine + Environment.NewLine);
     }
 
     static bool OwnsConsole()
@@ -757,10 +778,10 @@ static class Program
             p.ErrorDataReceived += collect;
             p.BeginOutputReadLine();
             p.BeginErrorReadLine();
-            if (!p.WaitForExit(90000))
+            if (!p.WaitForExit(45000))
             {
                 try { p.Kill(); } catch { }
-                return "（90 秒でタイムアウト）" + EdgeDetail(edge, pdf, null, log);
+                return "（45 秒でタイムアウト）" + EdgeDetail(edge, pdf, null, log);
             }
             p.WaitForExit(); // 非同期で読んでいる出力を最後まで受け取る
             exitCode = p.ExitCode;
